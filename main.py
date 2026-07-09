@@ -50,12 +50,6 @@ tfidf_obj: Any = None
 
 TITLE_TO_IDX: Optional[Dict[str, int]] = None
 
-# NEW: shared HTTP client, created once at startup and reused for every request.
-# This is the actual fix for the intermittent 502s — creating a fresh
-# httpx.AsyncClient() per-request meant every concurrent category call on
-# /home opened a brand new TCP + TLS connection to TMDB at the same time,
-# and any connection that failed/timed out got reported as a 502.
-http_client: Optional[httpx.AsyncClient] = None
 
 
 # =========================
@@ -98,13 +92,11 @@ async def lifespan(app: "FastAPI"):
     # Create ONE client for the whole app lifetime, with a connection pool
     # large enough to handle several concurrent TMDB calls (e.g. your 5
     # /home categories firing at once) without exhausting connections.
-    limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
-    http_client = httpx.AsyncClient(timeout=20, limits=limits)
 
     yield  # app runs here
 
     # Cleanup on shutdown
-    await http_client.aclose()
+    
 
 
 # =========================
@@ -178,63 +170,55 @@ def make_img_url(path: Optional[str]) -> Optional[str]:
 
 
 async def tmdb_get(
-    path: str, params: Dict[str, Any], max_retries: int = 2
+    path: str,
+    params: Dict[str, Any],
+    max_retries: int = 2,
 ) -> Dict[str, Any]:
-    """
-    Safe TMDB GET:
-    - Network errors -> 502 (after retries)
-    - TMDB API errors -> 502 with detail (after retries)
-
-    Uses the single shared http_client created at startup instead of
-    spinning up a new AsyncClient per call. Retries transient failures
-    (timeouts, connection resets, 429, 5xx) with a short backoff before
-    giving up, since these are common under TMDB's rate limits.
-    """
-    if http_client is None:
-        raise HTTPException(status_code=500, detail="HTTP client not initialized")
 
     q = dict(params)
     q["api_key"] = TMDB_API_KEY
 
-    last_error_detail = "Unknown error"
+    timeout = httpx.Timeout(20.0)
 
     for attempt in range(max_retries + 1):
         try:
-            r = await http_client.get(f"{TMDB_BASE}{path}", params=q)
-        except httpx.RequestError as e:
-            last_error_detail = f"TMDB request error: {type(e).__name__} | {repr(e)}"
-            logger.warning(
-                "tmdb_get %s attempt %d/%d failed: %s",
-                path, attempt + 1, max_retries + 1, last_error_detail,
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                http2=False,
+            ) as client:
+
+                response = await client.get(
+                    f"{TMDB_BASE}{path}",
+                    params=q,
+                )
+
+            response.raise_for_status()
+            return response.json()
+
+        except httpx.HTTPStatusError as e:
+
+            if e.response.status_code == 429 or e.response.status_code >= 500:
+                if attempt < max_retries:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+
+            raise HTTPException(
+                status_code=e.response.status_code,
+                detail=e.response.text,
             )
+
+        except httpx.RequestError as e:
+
+            logger.exception("TMDB Request Error")
+
             if attempt < max_retries:
                 await asyncio.sleep(0.5 * (attempt + 1))
                 continue
-            raise HTTPException(status_code=502, detail=last_error_detail)
 
-        if r.status_code == 200:
-            return r.json()
-
-        # Log every non-200 response with full body so we can see the real cause
-        last_error_detail = f"TMDB error {r.status_code}: {r.text}"
-        logger.warning(
-            "tmdb_get %s attempt %d/%d got status %d: %s",
-            path, attempt + 1, max_retries + 1, r.status_code, r.text[:300],
-        )
-
-        # Retry on rate limiting (429) or server-side errors (5xx)
-        if r.status_code == 429 or r.status_code >= 500:
-            if attempt < max_retries:
-                # Respect Retry-After header if TMDB sends one, else backoff
-                retry_after = r.headers.get("Retry-After")
-                delay = float(retry_after) if retry_after else 0.5 * (attempt + 1)
-                await asyncio.sleep(delay)
-                continue
-
-        raise HTTPException(status_code=502, detail=last_error_detail)
-
-    raise HTTPException(status_code=502, detail=last_error_detail)
-
+            raise HTTPException(
+                status_code=502,
+                detail=str(e),
+            )
 
 async def tmdb_cards_from_results(
     results: List[dict], limit: int = 20
