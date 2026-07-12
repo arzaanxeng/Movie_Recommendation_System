@@ -1,4 +1,4 @@
-# Movie Recommendation System
+# CineMatch - Movie Recommender
 >Live Link : https://movierecommendationsystem-production-61c8.up.railway.app
 
 ## System Architecture
@@ -155,4 +155,7 @@ The Docker image encapsulates all dependencies required for execution, ensuring 
 - Kubernetes Deployment
 - CI/CD Pipeline using GitHub Actions
 
+## Author
+
+- Arzaan NITH
 
