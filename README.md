@@ -1,6 +1,15 @@
 # CineMatch - Movie Recommender
 >Live Link : https://movierecommendationsystem-production-61c8.up.railway.app
 
+## Overview
+
+The following picture illustrates the CineMatch Landing Page Overview.
+
+<p align="center">
+    <img src="Architecture/LandingPage.png" width="900">
+</p>
+
+
 ## System Architecture
 
 The following diagram illustrates the high-level architecture of the Movie Recommendation System.
