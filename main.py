@@ -50,6 +50,8 @@ tfidf_obj: Any = None
 
 TITLE_TO_IDX: Optional[Dict[str, int]] = None
 
+# Shared, connection-pooled HTTP client (created once in lifespan)
+http_client: Optional[httpx.AsyncClient] = None
 
 
 # =========================
@@ -92,11 +94,22 @@ async def lifespan(app: "FastAPI"):
     # Create ONE client for the whole app lifetime, with a connection pool
     # large enough to handle several concurrent TMDB calls (e.g. your 5
     # /home categories firing at once) without exhausting connections.
+    limits = httpx.Limits(
+        max_connections=100,
+        max_keepalive_connections=20,
+        keepalive_expiry=30.0,
+    )
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(20.0),
+        limits=limits,
+        http2=False,
+    )
 
     yield  # app runs here
 
     # Cleanup on shutdown
-    
+    if http_client is not None:
+        await http_client.aclose()
 
 
 # =========================
@@ -175,22 +188,19 @@ async def tmdb_get(
     max_retries: int = 2,
 ) -> Dict[str, Any]:
 
+    global http_client
+    if http_client is None:
+        raise HTTPException(status_code=500, detail="HTTP client not initialized")
+
     q = dict(params)
     q["api_key"] = TMDB_API_KEY
 
-    timeout = httpx.Timeout(20.0)
-
     for attempt in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                http2=False,
-            ) as client:
-
-                response = await client.get(
-                    f"{TMDB_BASE}{path}",
-                    params=q,
-                )
+            response = await http_client.get(
+                f"{TMDB_BASE}{path}",
+                params=q,
+            )
 
             response.raise_for_status()
             return response.json()
@@ -499,8 +509,13 @@ async def search_bundle(
         except Exception:
             recs = []
 
-    for title, score in recs:
-        card = await attach_tmdb_card_by_title(title)
+    # Fetch TMDB cards for all TF-IDF recs concurrently instead of one-by-one.
+    # Previously this was a sequential loop (await in a for-loop), which meant
+    # each of the ~12 recommendation posters was fetched one after another —
+    # a major contributor to slow /movie/search responses.
+    card_tasks = [attach_tmdb_card_by_title(title) for title, _ in recs]
+    cards = await asyncio.gather(*card_tasks)
+    for (title, score), card in zip(recs, cards):
         tfidf_items.append(TFIDFRecItem(title=title, score=score, tmdb=card))
 
     # 2) Genre recommendations (TMDB discover by first genre)
